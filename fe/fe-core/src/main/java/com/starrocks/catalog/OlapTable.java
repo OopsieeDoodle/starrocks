@@ -1329,8 +1329,21 @@ public class OlapTable extends Table {
         if (info.getBucketNum() == 0) {
             if (info.getType() == DistributionInfo.DistributionInfoType.HASH) {
                 // infer bucket num
-                int numBucket = CatalogUtils.calAvgBucketNumOfRecentPartitions(this,
-                        5, Config.enable_auto_tablet_distribution);
+                Optional<Partition> anyRecentPartitionHasData = this.getRecentPartitions(Partition.RECENT_PARTITION_NUMBER)
+                        .stream()
+                        .filter(partition ->
+                                partition.getDefaultPhysicalPartition().getVisibleVersion() >
+                                        Partition.PARTITION_INIT_VERSION
+                        )
+                        .findAny();
+                int numBucket;
+                if (anyRecentPartitionHasData.isPresent()) {
+                    numBucket = CatalogUtils.calAvgBucketNumOfRecentPartitions(this,
+                            Partition.RECENT_PARTITION_NUMBER, Config.enable_auto_tablet_distribution);
+                } else {
+                    numBucket = CatalogUtils.calAvgBucketNumByLargestPartitions(this, Partition.RECENT_PARTITION_NUMBER,
+                            Config.enable_auto_tablet_distribution);
+                }
                 info.setBucketNum(numBucket);
             } else if (info.getType() == DistributionInfo.DistributionInfoType.RANDOM) {
                 // prior to use user set mutable bucket num
@@ -1661,6 +1674,12 @@ public class OlapTable extends Table {
             }
         });
         return partitions.subList(0, recentPartitionNum);
+    }
+
+    public Collection<Partition> getLargestDataSizePartitions(int numberToFetch) {
+        List<Partition> partitions = Lists.newArrayList(idToPartition.values());
+        partitions.sort(Comparator.comparingLong(Partition::getDataSize).reversed());
+        return partitions.subList(0, numberToFetch);
     }
 
     // get all partitions' name except the temp partitions

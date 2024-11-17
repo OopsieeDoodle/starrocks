@@ -57,6 +57,8 @@ public class Partition extends MetaObject implements GsonPostProcessable {
 
     public static final long PARTITION_INIT_VERSION = 1L;
 
+    public static final int RECENT_PARTITION_NUMBER = 5;
+
     public enum PartitionState {
         NORMAL,
         @Deprecated

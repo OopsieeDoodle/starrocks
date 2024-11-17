@@ -44,6 +44,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import static com.starrocks.sql.common.ErrorMsgProxy.PARSER_ERROR_MSG;
 
@@ -410,46 +411,83 @@ public class CatalogUtils {
                                                         boolean enableAutoTabletDistribution) {
         // 1. If the partition is less than recentPartitionNum, use backendNum to speculate the bucketNum
         //    Or the Config.enable_auto_tablet_distribution is disabled
-        int bucketNum = 0;
-        if (olapTable.getPartitions().size() < recentPartitionNum || !enableAutoTabletDistribution) {
-            bucketNum = CatalogUtils.calBucketNumAccordingToBackends();
-            // If table is not partitioned, the bucketNum should be at least DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM
-            if (!olapTable.getPartitionInfo().isPartitioned()) {
-                bucketNum = bucketNum > FeConstants.DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM ?
-                        bucketNum : FeConstants.DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM;
-            }
+        Integer bucketNum = calculateInitialBucketNumber(olapTable, recentPartitionNum, enableAutoTabletDistribution);
+        if (bucketNum != null) {
             return bucketNum;
         }
 
-        // 2. If the partition is not imported anydata, use backendNum to speculate the bucketNum
         List<Partition> partitions = (List<Partition>) olapTable.getRecentPartitions(recentPartitionNum);
-        boolean dataImported = true;
+        // 2. Use the totalSize of recentPartitions to speculate the bucketNum
+        long maxDataSize = 0;
         for (Partition partition : partitions) {
-            if (partition.getDefaultPhysicalPartition().getVisibleVersion() == 1) {
-                dataImported = false;
-                break;
+            if (partition.getDefaultPhysicalPartition().getVisibleVersion() > Partition.PARTITION_INIT_VERSION) {
+                maxDataSize = Math.max(maxDataSize, partition.getDataSize());
             }
         }
 
+        // 3. If the partition is not imported anydata, use backendNum to speculate the bucketNum
+        boolean dataImported = maxDataSize > 0;
         bucketNum = CatalogUtils.calBucketNumAccordingToBackends();
         if (!dataImported) {
             return bucketNum;
         }
 
-        // 3. Use the totalSize of recentPartitions to speculate the bucketNum
-        long maxDataSize = 0;
-        for (Partition partition : partitions) {
-            maxDataSize = Math.max(maxDataSize, partition.getDataSize());
-        }
         // A tablet will be regarded using the 1GB size
         // And also the number will not be larger than the calBucketNumAccordingToBackends()
         long speculateTabletNum = (maxDataSize + FeConstants.AUTO_DISTRIBUTION_UNIT - 1) / FeConstants.AUTO_DISTRIBUTION_UNIT;
-        // speculateTabletNum may be not accurate, so we need to take the max value of bucketNum and speculateTabletNum
-        bucketNum = (int) Math.max(bucketNum, speculateTabletNum);
+        bucketNum = (int) Math.min(bucketNum, speculateTabletNum);
         if (bucketNum == 0) {
             bucketNum = 1;
         }
         return bucketNum;
+    }
+
+    /**
+     * Calculate the average data size based on the largest partitions, and then further speculate the number of buckets
+     */
+    public static int calAvgBucketNumByLargestPartitions(OlapTable olapTable, int numberTobeCheck,
+                                                         boolean enableAutoTabletDistribution) {
+        Integer bucketNum = calculateInitialBucketNumber(olapTable, numberTobeCheck, enableAutoTabletDistribution);
+        if (bucketNum != null) {
+            return bucketNum;
+        }
+
+        List<Partition> largestDataSizePartitions = (List<Partition>) olapTable.getLargestDataSizePartitions(numberTobeCheck);
+        bucketNum = CatalogUtils.calBucketNumAccordingToBackends();
+
+        long avgDataSize = 0L;
+        int validPartitionCnt = 0;
+        for (Partition partition : largestDataSizePartitions) {
+            if (partition.getDefaultPhysicalPartition().getVisibleVersion() > Partition.PARTITION_INIT_VERSION) {
+                avgDataSize += partition.getDataSize();
+                validPartitionCnt++;
+            }
+        }
+
+        if (validPartitionCnt == 0) {
+            return bucketNum;
+        }
+
+        avgDataSize = avgDataSize / validPartitionCnt;
+        long speculateTabletNum = (avgDataSize + FeConstants.AUTO_DISTRIBUTION_UNIT - 1) / FeConstants.AUTO_DISTRIBUTION_UNIT;
+        bucketNum = (int) Math.min(bucketNum, speculateTabletNum);
+
+        return bucketNum == 0 ? 1 : bucketNum;
+    }
+
+    @Nullable
+    private static Integer calculateInitialBucketNumber(OlapTable olapTable, int numberTobeCheck,
+                                                        boolean enableAutoTabletDistribution) {
+        int bucketNum;
+        if (olapTable.getPartitions().size() < numberTobeCheck || !enableAutoTabletDistribution) {
+            bucketNum = CatalogUtils.calBucketNumAccordingToBackends();
+            // If table is not partitioned, the bucketNum should be at least DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM
+            if (!olapTable.getPartitionInfo().isPartitioned()) {
+                bucketNum = Math.max(bucketNum, FeConstants.DEFAULT_UNPARTITIONED_TABLE_BUCKET_NUM);
+            }
+            return bucketNum;
+        }
+        return null;
     }
 
     public static String addEscapeCharacter(String comment) {
